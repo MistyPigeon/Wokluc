@@ -1,22 +1,26 @@
 use crate::{
-    Directory, FsPathFollow, LibcReturn, OsError, OsResult, OsResultStatic, Utf8CStr, Utf8CStrBuf,
+    Directory, FsPathFollow, LibcReturn, LoggedResult, OsError, OsResult, Utf8CStr, Utf8CStrBuf,
     cstr, errno, error,
 };
 use bytemuck::{Pod, bytes_of, bytes_of_mut};
-use libc::{
-    EEXIST, ENOENT, F_OK, O_CLOEXEC, O_CREAT, O_PATH, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, c_uint,
-    makedev, mode_t, stat,
+use libc::{c_uint, makedev, mode_t};
+use nix::{
+    errno::Errno,
+    fcntl::{AT_FDCWD, OFlag},
+    sys::stat::{FchmodatFlags, Mode},
+    unistd::AccessFlags,
+    unistd::{Gid, Uid},
 };
-use mem::MaybeUninit;
 use num_traits::AsPrimitive;
 use std::cmp::min;
 use std::ffi::CStr;
 use std::fmt::Display;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::{io, mem, ptr, slice};
 
@@ -57,12 +61,12 @@ impl<T: Read + Seek> ReadSeekExt for T {
 }
 
 pub trait BufReadExt {
-    fn foreach_lines<F: FnMut(&mut String) -> bool>(&mut self, f: F);
-    fn foreach_props<F: FnMut(&str, &str) -> bool>(&mut self, f: F);
+    fn for_each_line<F: FnMut(&mut String) -> bool>(&mut self, f: F);
+    fn for_each_prop<F: FnMut(&str, &str) -> bool>(&mut self, f: F);
 }
 
 impl<T: BufRead> BufReadExt for T {
-    fn foreach_lines<F: FnMut(&mut String) -> bool>(&mut self, mut f: F) {
+    fn for_each_line<F: FnMut(&mut String) -> bool>(&mut self, mut f: F) {
         let mut buf = String::new();
         loop {
             match self.read_line(&mut buf) {
@@ -81,8 +85,11 @@ impl<T: BufRead> BufReadExt for T {
         }
     }
 
-    fn foreach_props<F: FnMut(&str, &str) -> bool>(&mut self, mut f: F) {
-        self.foreach_lines(|line| {
+    fn for_each_prop<F: FnMut(&str, &str) -> bool>(&mut self, mut f: F) {
+        self.for_each_line(|line| {
+            // Reserve an additional byte, because this string will be manually
+            // null terminated on the C++ side, and it may need more space.
+            line.reserve(1);
             let line = line.trim();
             if line.starts_with('#') {
                 return true;
@@ -116,15 +123,32 @@ impl<T: Write> WriteExt for T {
     }
 }
 
-fn open_fd(path: &Utf8CStr, flags: i32, mode: mode_t) -> OsResult<OwnedFd> {
-    unsafe {
-        let fd = libc::open(path.as_ptr(), flags, mode as c_uint).as_os_result(
-            "open",
-            Some(path),
-            None,
-        )?;
-        Ok(OwnedFd::from_raw_fd(fd))
+pub enum FileOrStd {
+    StdIn,
+    StdOut,
+    StdErr,
+    File(File),
+}
+
+impl FileOrStd {
+    pub fn as_file(&self) -> &File {
+        let raw_fd_ref: &'static RawFd = match self {
+            FileOrStd::StdIn => &0,
+            FileOrStd::StdOut => &1,
+            FileOrStd::StdErr => &2,
+            FileOrStd::File(file) => return file,
+        };
+        // SAFETY: File is guaranteed to have the same ABI as RawFd
+        unsafe { mem::transmute(raw_fd_ref) }
     }
+}
+
+fn open_fd(path: &Utf8CStr, flags: OFlag, mode: mode_t) -> OsResult<'_, OwnedFd> {
+    nix::fcntl::open(path, flags, Mode::from_bits_truncate(mode)).into_os_result(
+        "open",
+        Some(path),
+        None,
+    )
 }
 
 pub fn fd_path(fd: RawFd, buf: &mut dyn Utf8CStrBuf) -> OsResult<'static, ()> {
@@ -140,8 +164,14 @@ pub struct FileAttr {
     pub con: crate::Utf8CStrBufArr<128>,
 }
 
+impl Default for FileAttr {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FileAttr {
-    fn new() -> Self {
+    pub fn new() -> Self {
         FileAttr {
             st: unsafe { mem::zeroed() },
             #[cfg(feature = "selinux")]
@@ -190,180 +220,136 @@ impl FileAttr {
 
 const XATTR_NAME_SELINUX: &CStr = c"security.selinux";
 
+// Low-level methods, we should track the caller when error occurs, so return OsResult.
 impl Utf8CStr {
     pub fn follow_link(&self) -> &FsPathFollow {
         unsafe { mem::transmute(self) }
     }
 
-    pub fn open(&self, flags: i32) -> OsResult<File> {
+    pub fn open(&self, flags: OFlag) -> OsResult<'_, File> {
         Ok(File::from(open_fd(self, flags, 0)?))
     }
 
-    pub fn create(&self, flags: i32, mode: mode_t) -> OsResult<File> {
-        Ok(File::from(open_fd(self, O_CREAT | flags, mode)?))
+    pub fn create(&self, flags: OFlag, mode: mode_t) -> OsResult<'_, File> {
+        Ok(File::from(open_fd(self, OFlag::O_CREAT | flags, mode)?))
     }
 
     pub fn exists(&self) -> bool {
-        unsafe {
-            let mut st: stat = mem::zeroed();
-            libc::lstat(self.as_ptr(), &mut st) == 0
-        }
+        nix::sys::stat::lstat(self).is_ok()
     }
 
     pub fn rename_to<'a>(&'a self, name: &'a Utf8CStr) -> OsResult<'a, ()> {
-        unsafe {
-            libc::rename(self.as_ptr(), name.as_ptr()).check_os_err(
-                "rename",
-                Some(self),
-                Some(name),
-            )
-        }
+        nix::fcntl::renameat(AT_FDCWD, self, AT_FDCWD, name).check_os_err(
+            "rename",
+            Some(self),
+            Some(name),
+        )
     }
 
-    pub fn remove(&self) -> OsResult<()> {
+    pub fn remove(&self) -> OsResult<'_, ()> {
         unsafe { libc::remove(self.as_ptr()).check_os_err("remove", Some(self), None) }
     }
 
-    pub fn remove_all(&self) -> OsResultStatic<()> {
-        let attr = self.get_attr()?;
-        if attr.is_dir() {
-            let mut dir = Directory::try_from(open_fd(self, O_RDONLY | O_CLOEXEC, 0)?)?;
-            dir.remove_all()?;
-        }
-        Ok(self.remove()?)
-    }
-
     #[allow(clippy::unnecessary_cast)]
-    pub fn read_link(&self, buf: &mut dyn Utf8CStrBuf) -> OsResult<()> {
+    pub fn read_link(&self, buf: &mut dyn Utf8CStrBuf) -> OsResult<'_, ()> {
         buf.clear();
         unsafe {
             let r = libc::readlink(self.as_ptr(), buf.as_mut_ptr(), buf.capacity() - 1)
-                .as_os_result("readlink", Some(self), None)? as isize;
+                .into_os_result("readlink", Some(self), None)? as isize;
             *(buf.as_mut_ptr().offset(r) as *mut u8) = b'\0';
-            buf.set_len(r as usize);
         }
+        buf.rebuild().ok();
         Ok(())
     }
 
-    pub fn mkdir(&self, mode: mode_t) -> OsResult<()> {
-        unsafe {
-            if libc::mkdir(self.as_ptr(), mode) < 0 {
-                if *errno() == EEXIST {
-                    libc::chmod(self.as_ptr(), mode).check_os_err("chmod", Some(self), None)?;
-                } else {
-                    return Err(OsError::last_os_error("mkdir", Some(self), None));
-                }
-            }
+    pub fn mkdir(&self, mode: mode_t) -> OsResult<'_, ()> {
+        match nix::unistd::mkdir(self, Mode::from_bits_truncate(mode)) {
+            Ok(_) | Err(Errno::EEXIST) => Ok(()),
+            Err(e) => Err(OsError::new(e, "mkdir", Some(self), None)),
         }
-        Ok(())
-    }
-
-    pub fn mkdirs(&self, mode: mode_t) -> OsResultStatic<()> {
-        if self.is_empty() {
-            return Ok(());
-        }
-
-        let mut path = cstr::buf::default();
-        let mut components = self.split('/').filter(|s| !s.is_empty());
-
-        if self.starts_with('/') {
-            path.append_path("/");
-        }
-
-        loop {
-            let Some(s) = components.next() else {
-                break;
-            };
-            path.append_path(s);
-
-            unsafe {
-                if libc::mkdir(path.as_ptr(), mode) < 0 && *errno() != EEXIST {
-                    return Err(OsError::last_os_error("mkdir", Some(&path), None))?;
-                }
-            }
-        }
-
-        *errno() = 0;
-        Ok(())
     }
 
     // Inspired by https://android.googlesource.com/platform/bionic/+/master/libc/bionic/realpath.cpp
-    pub fn realpath(&self, buf: &mut dyn Utf8CStrBuf) -> OsResult<()> {
-        let fd = self.open(O_PATH | O_CLOEXEC)?;
-        let mut st1: libc::stat;
-        let mut st2: libc::stat;
+    pub fn realpath(&self, buf: &mut dyn Utf8CStrBuf) -> OsResult<'_, ()> {
+        let fd = self.open(OFlag::O_PATH | OFlag::O_CLOEXEC)?;
         let mut skip_check = false;
-        unsafe {
-            st1 = mem::zeroed();
-            if libc::fstat(fd.as_raw_fd(), &mut st1) < 0 {
+
+        let st1 = match nix::sys::stat::fstat(&fd) {
+            Ok(st) => st,
+            Err(_) => {
                 // This will only fail on Linux < 3.6
                 skip_check = true;
+                unsafe { mem::zeroed() }
             }
-        }
+        };
+
         fd_path(fd.as_raw_fd(), buf)?;
-        unsafe {
-            st2 = mem::zeroed();
-            libc::stat(buf.as_ptr(), &mut st2).check_os_err("stat", Some(self), None)?;
-            if !skip_check && (st2.st_dev != st1.st_dev || st2.st_ino != st1.st_ino) {
-                *errno() = ENOENT;
-                return Err(OsError::last_os_error("realpath", Some(self), None));
-            }
+
+        let st2 = nix::sys::stat::stat(buf.as_cstr()).into_os_result("stat", Some(self), None)?;
+        if !skip_check && (st2.st_dev != st1.st_dev || st2.st_ino != st1.st_ino) {
+            return Err(OsError::new(Errno::ENOENT, "realpath", Some(self), None));
         }
         Ok(())
     }
 
-    pub fn get_attr(&self) -> OsResult<FileAttr> {
-        let mut attr = FileAttr::new();
-        unsafe {
-            libc::lstat(self.as_ptr(), &mut attr.st).check_os_err("lstat", Some(self), None)?;
-
+    pub fn get_attr(&self) -> OsResult<'_, FileAttr> {
+        #[allow(unused_mut)]
+        let mut attr = FileAttr {
+            st: nix::sys::stat::lstat(self).into_os_result("lstat", Some(self), None)?,
             #[cfg(feature = "selinux")]
-            self.get_secontext(&mut attr.con)?;
-        }
+            con: cstr::buf::new(),
+        };
+        #[cfg(feature = "selinux")]
+        self.get_secontext(&mut attr.con)?;
         Ok(attr)
     }
 
     pub fn set_attr<'a>(&'a self, attr: &'a FileAttr) -> OsResult<'a, ()> {
-        unsafe {
-            if !attr.is_symlink() && libc::chmod(self.as_ptr(), (attr.st.st_mode & 0o777).as_()) < 0
-            {
-                let self_attr = self.get_attr()?;
-                if !self_attr.is_symlink() {
-                    return Err(OsError::last_os_error("chmod", Some(self), None));
-                }
+        if !attr.is_symlink()
+            && let Err(e) = self.follow_link().chmod((attr.st.st_mode & 0o777).as_())
+        {
+            // Double check if self is symlink before reporting error
+            let self_attr = self.get_attr()?;
+            if !self_attr.is_symlink() {
+                return Err(e);
             }
+        }
+
+        unsafe {
             libc::lchown(self.as_ptr(), attr.st.st_uid, attr.st.st_gid).check_os_err(
                 "lchown",
                 Some(self),
                 None,
             )?;
+        }
 
-            #[cfg(feature = "selinux")]
-            if !attr.con.is_empty() {
-                self.set_secontext(&attr.con)?;
-            }
+        #[cfg(feature = "selinux")]
+        if !attr.con.is_empty() {
+            self.set_secontext(&attr.con)?;
         }
         Ok(())
     }
 
-    pub fn get_secontext(&self, con: &mut dyn Utf8CStrBuf) -> OsResult<()> {
-        unsafe {
-            let sz = libc::lgetxattr(
+    pub fn get_secontext(&self, con: &mut dyn Utf8CStrBuf) -> OsResult<'_, ()> {
+        con.clear();
+        let result = unsafe {
+            libc::lgetxattr(
                 self.as_ptr(),
                 XATTR_NAME_SELINUX.as_ptr(),
                 con.as_mut_ptr().cast(),
                 con.capacity(),
-            );
-            if sz < 1 {
-                con.clear();
-                if *errno() != libc::ENODATA {
-                    return Err(OsError::last_os_error("lgetxattr", Some(self), None));
-                }
-            } else {
-                con.set_len((sz - 1) as usize);
+            )
+            .check_err()
+        };
+
+        match result {
+            Ok(_) => {
+                con.rebuild().ok();
+                Ok(())
             }
+            Err(Errno::ENODATA) => Ok(()),
+            Err(e) => Err(OsError::new(e, "lgetxattr", Some(self), None)),
         }
-        Ok(())
     }
 
     pub fn set_secontext<'a>(&'a self, con: &'a Utf8CStr) -> OsResult<'a, ()> {
@@ -377,51 +363,6 @@ impl Utf8CStr {
             )
             .check_os_err("lsetxattr", Some(self), Some(con))
         }
-    }
-
-    pub fn copy_to(&self, path: &Utf8CStr) -> OsResultStatic<()> {
-        let attr = self.get_attr()?;
-        if attr.is_dir() {
-            path.mkdir(0o777)?;
-            let mut src = Directory::open(self)?;
-            let dest = Directory::open(path)?;
-            src.copy_into(&dest)?;
-        } else {
-            // It's OK if remove failed
-            path.remove().ok();
-            if attr.is_file() {
-                let mut src = self.open(O_RDONLY | O_CLOEXEC)?;
-                let mut dest = path.create(O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0o777)?;
-                std::io::copy(&mut src, &mut dest)?;
-            } else if attr.is_symlink() {
-                let mut buf = cstr::buf::default();
-                self.read_link(&mut buf)?;
-                unsafe {
-                    libc::symlink(buf.as_ptr(), path.as_ptr()).check_os_err(
-                        "symlink",
-                        Some(&buf),
-                        Some(path),
-                    )?;
-                }
-            }
-        }
-        path.set_attr(&attr)?;
-        Ok(())
-    }
-
-    pub fn move_to(&self, path: &Utf8CStr) -> OsResultStatic<()> {
-        if path.exists() {
-            let attr = path.get_attr()?;
-            if attr.is_dir() {
-                let mut src = Directory::open(self)?;
-                let dest = Directory::open(path)?;
-                return src.move_into(&dest);
-            } else {
-                path.remove()?;
-            }
-        }
-        self.rename_to(path)?;
-        Ok(())
     }
 
     pub fn parent_dir(&self) -> Option<&str> {
@@ -439,8 +380,119 @@ impl Utf8CStr {
             .map(|s| unsafe { std::str::from_utf8_unchecked(s.as_bytes()) })
     }
 
+    // ln -s target self
+    pub fn create_symlink_to<'a>(&'a self, target: &'a Utf8CStr) -> OsResult<'a, ()> {
+        nix::unistd::symlinkat(target, AT_FDCWD, self).check_os_err(
+            "symlink",
+            Some(target),
+            Some(self),
+        )
+    }
+
+    pub fn mkfifo(&self, mode: mode_t) -> OsResult<'_, ()> {
+        nix::unistd::mkfifo(self, Mode::from_bits_truncate(mode)).check_os_err(
+            "mkfifo",
+            Some(self),
+            None,
+        )
+    }
+}
+
+// High-level helper methods, composed of multiple operations.
+// We should treat these as application logic and log ASAP, so return LoggedResult.
+impl Utf8CStr {
+    pub fn remove_all(&self) -> LoggedResult<()> {
+        let attr = match self.get_attr() {
+            Ok(attr) => attr,
+            Err(e) => {
+                return match e.errno {
+                    // Allow calling remove_all on non-existence file
+                    Errno::ENOENT => Ok(()),
+                    _ => Err(e)?,
+                };
+            }
+        };
+        if attr.is_dir() {
+            let dir = Directory::open(self)?;
+            dir.remove_all()?;
+        }
+        Ok(self.remove()?)
+    }
+
+    pub fn mkdirs(&self, mode: mode_t) -> LoggedResult<()> {
+        if self.is_empty() {
+            return Ok(());
+        }
+
+        let mut path = cstr::buf::default();
+        let mut components = self.split('/').filter(|s| !s.is_empty());
+
+        if self.starts_with('/') {
+            path.append_path("/");
+        }
+
+        loop {
+            let Some(s) = components.next() else {
+                break;
+            };
+            path.append_path(s);
+            path.mkdir(mode)?;
+        }
+
+        *errno() = 0;
+        Ok(())
+    }
+
+    pub fn copy_to(&self, path: &Utf8CStr) -> LoggedResult<()> {
+        let attr = self.get_attr()?;
+        if attr.is_dir() {
+            path.mkdir(0o777)?;
+            let mut src = Directory::open(self)?;
+            let dest = Directory::open(path)?;
+            src.copy_into(&dest)?;
+        } else {
+            // It's OK if remove failed
+            path.remove().ok();
+            if attr.is_file() {
+                let mut src = self.open(OFlag::O_RDONLY | OFlag::O_CLOEXEC)?;
+                let mut dest = path.create(
+                    OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_TRUNC | OFlag::O_CLOEXEC,
+                    0o777,
+                )?;
+                std::io::copy(&mut src, &mut dest)?;
+            } else if attr.is_symlink() {
+                let mut buf = cstr::buf::default();
+                self.read_link(&mut buf)?;
+                unsafe {
+                    libc::symlink(buf.as_ptr(), path.as_ptr()).check_os_err(
+                        "symlink",
+                        Some(&buf),
+                        Some(path),
+                    )?;
+                }
+            }
+        }
+        path.set_attr(&attr)?;
+        Ok(())
+    }
+
+    pub fn move_to(&self, path: &Utf8CStr) -> LoggedResult<()> {
+        if path.exists() {
+            let attr = path.get_attr()?;
+            if attr.is_dir() {
+                let mut src = Directory::open(self)?;
+                let dest = Directory::open(path)?;
+                return src.move_into(&dest);
+            } else {
+                path.remove()?;
+            }
+        }
+        self.rename_to(path)?;
+        Ok(())
+    }
+
     // ln self path
-    pub fn link_to(&self, path: &Utf8CStr) -> OsResultStatic<()> {
+    pub fn link_to(&self, path: &Utf8CStr) -> LoggedResult<()> {
         let attr = self.get_attr()?;
         if attr.is_dir() {
             path.mkdir(0o777)?;
@@ -459,78 +511,76 @@ impl Utf8CStr {
             Ok(())
         }
     }
-
-    // ln -s target self
-    pub fn create_symlink_to<'a>(&'a self, target: &'a Utf8CStr) -> OsResult<'a, ()> {
-        unsafe {
-            libc::symlink(target.as_ptr(), self.as_ptr()).check_os_err(
-                "symlink",
-                Some(target),
-                Some(self),
-            )
-        }
-    }
-
-    pub fn mkfifo(&self, mode: mode_t) -> OsResult<()> {
-        unsafe { libc::mkfifo(self.as_ptr(), mode).check_os_err("mkfifo", Some(self), None) }
-    }
 }
 
 impl FsPathFollow {
     pub fn exists(&self) -> bool {
-        unsafe { libc::access(self.as_ptr(), F_OK) == 0 }
+        nix::unistd::access(self.as_utf8_cstr(), AccessFlags::F_OK).is_ok()
     }
 
-    pub fn get_attr(&self) -> OsResult<FileAttr> {
-        let mut attr = FileAttr::new();
-        unsafe {
-            libc::stat(self.as_ptr(), &mut attr.st).check_os_err("stat", Some(self), None)?;
+    pub fn chmod(&self, mode: mode_t) -> OsResult<'_, ()> {
+        nix::sys::stat::fchmodat(
+            AT_FDCWD,
+            self.as_utf8_cstr(),
+            Mode::from_bits_truncate(mode),
+            FchmodatFlags::FollowSymlink,
+        )
+        .check_os_err("chmod", Some(self), None)
+    }
 
+    pub fn get_attr(&self) -> OsResult<'_, FileAttr> {
+        #[allow(unused_mut)]
+        let mut attr = FileAttr {
+            st: nix::sys::stat::stat(self.as_utf8_cstr()).into_os_result(
+                "lstat",
+                Some(self),
+                None,
+            )?,
             #[cfg(feature = "selinux")]
-            self.get_secontext(&mut attr.con)?;
-        }
+            con: cstr::buf::new(),
+        };
+        #[cfg(feature = "selinux")]
+        self.get_secontext(&mut attr.con)?;
         Ok(attr)
     }
 
     pub fn set_attr<'a>(&'a self, attr: &'a FileAttr) -> OsResult<'a, ()> {
-        unsafe {
-            libc::chmod(self.as_ptr(), (attr.st.st_mode & 0o777).as_()).check_os_err(
-                "chmod",
-                Some(self),
-                None,
-            )?;
-            libc::chown(self.as_ptr(), attr.st.st_uid, attr.st.st_gid).check_os_err(
-                "chown",
-                Some(self),
-                None,
-            )?;
+        self.chmod((attr.st.st_mode & 0o777).as_())?;
 
-            #[cfg(feature = "selinux")]
-            if !attr.con.is_empty() {
-                self.set_secontext(&attr.con)?;
-            }
+        nix::unistd::chown(
+            self.as_utf8_cstr(),
+            Some(Uid::from(attr.st.st_uid)),
+            Some(Gid::from(attr.st.st_gid)),
+        )
+        .check_os_err("chown", Some(self), None)?;
+
+        #[cfg(feature = "selinux")]
+        if !attr.con.is_empty() {
+            self.set_secontext(&attr.con)?;
         }
         Ok(())
     }
 
-    pub fn get_secontext(&self, con: &mut dyn Utf8CStrBuf) -> OsResult<()> {
-        unsafe {
-            let sz = libc::getxattr(
+    pub fn get_secontext(&self, con: &mut dyn Utf8CStrBuf) -> OsResult<'_, ()> {
+        con.clear();
+        let result = unsafe {
+            libc::getxattr(
                 self.as_ptr(),
                 XATTR_NAME_SELINUX.as_ptr(),
                 con.as_mut_ptr().cast(),
                 con.capacity(),
-            );
-            if sz < 1 {
-                con.clear();
-                if *errno() != libc::ENODATA {
-                    return Err(OsError::last_os_error("getxattr", Some(self), None));
-                }
-            } else {
-                con.set_len((sz - 1) as usize);
+            )
+            .check_err()
+        };
+
+        match result {
+            Ok(_) => {
+                con.rebuild().ok();
+                Ok(())
             }
+            Err(Errno::ENODATA) => Ok(()),
+            Err(e) => Err(OsError::new(e, "getxattr", Some(self), None)),
         }
-        Ok(())
     }
 
     pub fn set_secontext<'a>(&'a self, con: &'a Utf8CStr) -> OsResult<'a, ()> {
@@ -583,7 +633,7 @@ impl<S: Utf8CStrBuf + Sized> FsPathBuilder for S {
     }
 
     fn append_path_fmt<T: Display>(&mut self, name: T) -> &mut Self {
-        self.write_fmt(format_args!("/{}", name)).ok();
+        self.write_fmt(format_args!("/{name}")).ok();
         self
     }
 }
@@ -595,7 +645,7 @@ impl FsPathBuilder for dyn Utf8CStrBuf + '_ {
     }
 
     fn append_path_fmt<T: Display>(&mut self, name: T) -> &mut Self {
-        self.write_fmt(format_args!("/{}", name)).ok();
+        self.write_fmt(format_args!("/{name}")).ok();
         self
     }
 }
@@ -611,7 +661,7 @@ pub fn fd_get_attr(fd: RawFd) -> OsResult<'static, FileAttr> {
     Ok(attr)
 }
 
-pub fn fd_set_attr(fd: RawFd, attr: &FileAttr) -> OsResult<()> {
+pub fn fd_set_attr(fd: RawFd, attr: &FileAttr) -> OsResult<'_, ()> {
     unsafe {
         libc::fchmod(fd, (attr.st.st_mode & 0o777).as_()).check_os_err("fchmod", None, None)?;
         libc::fchown(fd, attr.st.st_uid, attr.st.st_gid).check_os_err("fchown", None, None)?;
@@ -625,25 +675,28 @@ pub fn fd_set_attr(fd: RawFd, attr: &FileAttr) -> OsResult<()> {
 }
 
 pub fn fd_get_secontext(fd: RawFd, con: &mut dyn Utf8CStrBuf) -> OsResult<'static, ()> {
-    unsafe {
-        let sz = libc::fgetxattr(
+    con.clear();
+    let result = unsafe {
+        libc::fgetxattr(
             fd,
             XATTR_NAME_SELINUX.as_ptr(),
             con.as_mut_ptr().cast(),
             con.capacity(),
-        );
-        if sz < 1 {
-            if *errno() != libc::ENODATA {
-                return Err(OsError::last_os_error("fgetxattr", None, None));
-            }
-        } else {
-            con.set_len((sz - 1) as usize);
+        )
+        .check_err()
+    };
+
+    match result {
+        Ok(_) => {
+            con.rebuild().ok();
+            Ok(())
         }
+        Err(Errno::ENODATA) => Ok(()),
+        Err(e) => Err(OsError::new(e, "fgetxattr", None, None)),
     }
-    Ok(())
 }
 
-pub fn fd_set_secontext(fd: RawFd, con: &Utf8CStr) -> OsResult<()> {
+pub fn fd_set_secontext(fd: RawFd, con: &Utf8CStr) -> OsResult<'_, ()> {
     unsafe {
         libc::fsetxattr(
             fd,
@@ -669,11 +722,11 @@ pub fn fclone_attr(a: RawFd, b: RawFd) -> OsResult<'static, ()> {
 pub struct MappedFile(&'static mut [u8]);
 
 impl MappedFile {
-    pub fn open(path: &Utf8CStr) -> OsResult<MappedFile> {
+    pub fn open(path: &Utf8CStr) -> OsResult<'_, MappedFile> {
         Ok(MappedFile(map_file(path, false)?))
     }
 
-    pub fn open_rw(path: &Utf8CStr) -> OsResult<MappedFile> {
+    pub fn open_rw(path: &Utf8CStr) -> OsResult<'_, MappedFile> {
         Ok(MappedFile(map_file(path, true)?))
     }
 
@@ -716,8 +769,8 @@ unsafe extern "C" {
 }
 
 // We mark the returned slice static because it is valid until explicitly unmapped
-pub(crate) fn map_file(path: &Utf8CStr, rw: bool) -> OsResult<&'static mut [u8]> {
-    unsafe { map_file_at(BorrowedFd::borrow_raw(libc::AT_FDCWD), path, rw) }
+pub(crate) fn map_file(path: &Utf8CStr, rw: bool) -> OsResult<'_, &'static mut [u8]> {
+    map_file_at(AT_FDCWD, path, rw)
 }
 
 pub(crate) fn map_file_at<'a>(
@@ -731,17 +784,9 @@ pub(crate) fn map_file_at<'a>(
     #[cfg(target_pointer_width = "32")]
     const BLKGETSIZE64: u32 = 0x80041272;
 
-    let flag = if rw { O_RDWR } else { O_RDONLY };
-    let fd = unsafe {
-        OwnedFd::from_raw_fd(
-            libc::openat(dirfd.as_raw_fd(), path.as_ptr(), flag | O_CLOEXEC).as_os_result(
-                "openat",
-                Some(path),
-                None,
-            )?,
-        )
-    };
-
+    let flag = if rw { OFlag::O_RDWR } else { OFlag::O_RDONLY };
+    let fd = nix::fcntl::openat(dirfd, path, flag | OFlag::O_CLOEXEC, Mode::empty())
+        .into_os_result("openat", Some(path), None)?;
     let attr = fd_get_attr(fd.as_raw_fd())?;
     let sz = if attr.is_block_device() {
         let mut sz = 0_u64;
@@ -846,9 +891,9 @@ fn parse_mount_info_line(line: &str) -> Option<MountInfo> {
 
 pub fn parse_mount_info(pid: &str) -> Vec<MountInfo> {
     let mut res = vec![];
-    let mut path = format!("/proc/{}/mountinfo", pid);
-    if let Ok(file) = Utf8CStr::from_string(&mut path).open(O_RDONLY | O_CLOEXEC) {
-        BufReader::new(file).foreach_lines(|line| {
+    let mut path = format!("/proc/{pid}/mountinfo");
+    if let Ok(file) = Utf8CStr::from_string(&mut path).open(OFlag::O_RDONLY | OFlag::O_CLOEXEC) {
+        BufReader::new(file).for_each_line(|line| {
             parse_mount_info_line(line)
                 .map(|info| res.push(info))
                 .is_some()

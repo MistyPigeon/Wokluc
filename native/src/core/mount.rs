@@ -1,19 +1,17 @@
-use std::{
-    cmp::Ordering::{Greater, Less},
-    path::{Path, PathBuf},
-};
-
-use num_traits::AsPrimitive;
-
-use base::libc::{c_uint, dev_t};
+use crate::consts::{MODULEMNT, MODULEROOT, PREINITDEV, PREINITMIRR, WORKERDIR};
+use crate::ffi::{get_magisk_tmp, resolve_preinit_dir, switch_mnt_ns};
+use crate::resetprop::get_prop;
 use base::{
     FsPathBuilder, LibcReturn, LoggedResult, MountInfo, ResultExt, Utf8CStr, Utf8CStrBuf, cstr,
     debug, info, libc, parse_mount_info, warn,
 };
-
-use crate::consts::{MODULEMNT, MODULEROOT, PREINITDEV, PREINITMIRR, WORKERDIR};
-use crate::ffi::{get_magisk_tmp, resolve_preinit_dir, switch_mnt_ns};
-use crate::get_prop;
+use libc::{c_uint, dev_t};
+use nix::{
+    mount::MsFlags,
+    sys::stat::{Mode, SFlag, mknod},
+};
+use num_traits::AsPrimitive;
+use std::{cmp::Ordering::Greater, cmp::Ordering::Less, path::Path, path::PathBuf};
 
 pub fn setup_preinit_dir() {
     let magisk_tmp = get_magisk_tmp();
@@ -22,37 +20,37 @@ pub fn setup_preinit_dir() {
     let dev_path = cstr::buf::new::<64>()
         .join_path(magisk_tmp)
         .join_path(PREINITDEV);
-    if let Ok(attr) = dev_path.get_attr() {
-        if attr.st.st_mode & libc::S_IFMT as c_uint == libc::S_IFBLK.as_() {
-            // DO NOT mount the block device directly, as we do not know the flags and configs
-            // to properly mount the partition; mounting block devices directly as rw could cause
-            // crashes if the filesystem driver is crap (e.g. some broken F2FS drivers).
-            // What we do instead is to scan through the current mountinfo and find a pre-existing
-            // mount point mounting our desired partition, and then bind mount the target folder.
-            let preinit_dev = attr.st.st_rdev;
-            let mnt_path = cstr::buf::default()
-                .join_path(magisk_tmp)
-                .join_path(PREINITMIRR);
-            for info in parse_mount_info("self") {
-                if info.root == "/" && info.device == preinit_dev {
-                    if !info.fs_option.split(',').any(|s| s == "rw") {
-                        // Only care about rw mounts
-                        continue;
-                    }
-                    let mut target = info.target;
-                    let target = Utf8CStr::from_string(&mut target);
-                    let mut preinit_dir = resolve_preinit_dir(target);
-                    let preinit_dir = Utf8CStr::from_string(&mut preinit_dir);
-                    let r: LoggedResult<()> = try {
-                        preinit_dir.mkdir(0o700)?;
-                        mnt_path.mkdirs(0o755)?;
-                        mnt_path.remove().ok();
-                        mnt_path.create_symlink_to(preinit_dir)?;
-                    };
-                    if r.is_ok() {
-                        info!("* Found preinit dir: {}", preinit_dir);
-                        return;
-                    }
+    if let Ok(attr) = dev_path.get_attr()
+        && attr.st.st_mode & libc::S_IFMT as c_uint == libc::S_IFBLK.as_()
+    {
+        // DO NOT mount the block device directly, as we do not know the flags and configs
+        // to properly mount the partition; mounting block devices directly as rw could cause
+        // crashes if the filesystem driver is crap (e.g. some broken F2FS drivers).
+        // What we do instead is to scan through the current mountinfo and find a pre-existing
+        // mount point mounting our desired partition, and then bind mount the target folder.
+        let preinit_dev = attr.st.st_rdev;
+        let mnt_path = cstr::buf::default()
+            .join_path(magisk_tmp)
+            .join_path(PREINITMIRR);
+        for info in parse_mount_info("self") {
+            if info.root == "/" && info.device == preinit_dev {
+                if !info.fs_option.split(',').any(|s| s == "rw") {
+                    // Only care about rw mounts
+                    continue;
+                }
+                let mut target = info.target;
+                let target = Utf8CStr::from_string(&mut target);
+                let mut preinit_dir = resolve_preinit_dir(target);
+                let preinit_dir = Utf8CStr::from_string(&mut preinit_dir);
+                let r: LoggedResult<()> = try {
+                    preinit_dir.mkdir(0o700)?;
+                    mnt_path.mkdirs(0o755)?;
+                    mnt_path.remove().ok();
+                    mnt_path.create_symlink_to(preinit_dir)?;
+                };
+                if r.is_ok() {
+                    info!("* Found preinit dir: {}", preinit_dir);
+                    return;
                 }
             }
         }
@@ -69,7 +67,7 @@ pub fn setup_module_mount() {
     let _: LoggedResult<()> = try {
         module_mnt.mkdir(0o755)?;
         cstr!(MODULEROOT).bind_mount_to(&module_mnt, false)?;
-        module_mnt.remount_mount_point_flags(libc::MS_RDONLY)?;
+        module_mnt.remount_mount_point_flags(MsFlags::MS_RDONLY)?;
     };
 }
 
@@ -110,11 +108,11 @@ enum EncryptType {
 }
 
 pub fn find_preinit_device() -> String {
-    let encrypt_type = if get_prop(cstr!("ro.crypto.state"), false) != "encrypted" {
+    let encrypt_type = if get_prop(cstr!("ro.crypto.state")) != "encrypted" {
         EncryptType::None
-    } else if get_prop(cstr!("ro.crypto.type"), false) == "block" {
+    } else if get_prop(cstr!("ro.crypto.type")) == "block" {
         EncryptType::Block
-    } else if get_prop(cstr!("ro.crypto.metadata.enabled"), false) == "true" {
+    } else if get_prop(cstr!("ro.crypto.metadata.enabled")) == "true" {
         EncryptType::Metadata
     } else {
         EncryptType::File
@@ -194,16 +192,14 @@ pub fn find_preinit_device() -> String {
         if std::env::var_os("MAKEDEV").is_some() {
             buf.clear();
             let dev_path = buf.append_path(&tmp).append_path(PREINITDEV);
-            unsafe {
-                libc::mknod(
-                    dev_path.as_ptr(),
-                    libc::S_IFBLK | 0o600,
-                    info.device as dev_t,
-                )
-                .check_io_err()
-                .log()
-                .ok();
-            }
+            mknod(
+                dev_path.as_utf8_cstr(),
+                SFlag::S_IFBLK,
+                Mode::from_bits_truncate(0o600),
+                info.device as dev_t,
+            )
+            .check_os_err("mknod", Some(dev_path), None)
+            .log_ok();
         }
     }
     Path::new(&info.source)
@@ -238,10 +234,10 @@ pub fn revert_unmount(pid: i32) {
     let mut prev: Option<PathBuf> = None;
     targets.sort();
     targets.retain(|target| {
-        if let Some(prev) = &prev {
-            if Path::new(target).starts_with(prev) {
-                return false;
-            }
+        if let Some(prev) = &prev
+            && Path::new(target).starts_with(prev)
+        {
+            return false;
         }
         prev = Some(PathBuf::from(target.clone()));
         true
@@ -249,10 +245,8 @@ pub fn revert_unmount(pid: i32) {
 
     for mut target in targets {
         let target = Utf8CStr::from_string(&mut target);
-        unsafe {
-            if libc::umount2(target.as_ptr(), libc::MNT_DETACH) == 0 {
-                debug!("denylist: Unmounted ({})", target);
-            }
+        if target.unmount().is_ok() {
+            debug!("denylist: Unmounted ({})", target);
         }
     }
 }

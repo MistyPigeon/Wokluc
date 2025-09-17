@@ -10,45 +10,48 @@ edition = "2024"
 [workspace.dependencies]
 cxx = { path = "external/cxx-rs" }
 cxx-gen = { path = "external/cxx-rs/gen/lib" }
-libc = "0.2.172"
-cfg-if = "1.0.1"
+libc = "0.2.175"
+cfg-if = "1.0.3"
 num-traits = "0.2.19"
 num-derive = "0.4.2"
-thiserror = "2.0.12"
+thiserror = "2.0.16"
 byteorder = "1.5.0"
 size = "0.5.0"
-bytemuck = "1.23.1"
+bytemuck = "1.23.2"
 fdt = "0.1.5"
 const_format = "0.2.34"
 bit-set = "0.8.0"
-syn = "2.0.102"
+syn = "2.0.106"
 quote = "1.0.40"
-proc-macro2 = "1.0.95"
+proc-macro2 = "1.0.101"
 argh = { version = "0.1.13", default-features = false }
 pb-rs = { version = "0.10.0", default-features = false }
 quick-protobuf = "0.8.1"
 flate2 = { version = "1.1.2", default-features = false }
-bzip2 = { version = "0.5.2", default-features = false }
+bzip2 = "0.6.0"
 zopfli = "0.8.2"
 lz4 = "1.28.1"
-xz2 = "0.1.7"
+lzma-rust2 = { version = "0.13.0", default-features = false, features = ["xz", "std", "encoder", "optimization"] }
+nix = "0.30.1"
+bitflags = "2.9.4"
 
 # Rust crypto crates are tied together
-sha1 = "0.11.0-rc.0"
-sha2 = "0.11.0-rc.0"
-digest = "0.11.0-rc.0"
-p256 = "0.14.0-pre.5"
-p384 = "0.14.0-pre.5"
-p521 = "0.14.0-pre.5"
-rsa = "0.10.0-rc.0"
-x509-cert = "0.3.0-rc.0"
-der = "0.8.0-rc.4"
+sha1 = "0.11.0-rc.2"
+sha2 = "0.11.0-rc.2"
+digest = "0.11.0-rc.1"
+p256 = "0.14.0-pre.10"
+p384 = "0.14.0-pre.10"
+p521 = "0.14.0-pre.10"
+rsa = "0.10.0-rc.6"
+x509-cert = "0.3.0-rc.1"
+der = "0.8.0-rc.8"
 
 [patch.crates-io]
 pb-rs = { git = "https://github.com/tafia/quick-protobuf.git" }
 quick-protobuf = { git = "https://github.com/tafia/quick-protobuf.git" }
 lz4-sys = { path = "external/lz4-sys" }
-lzma-sys = { path = "external/lzma-sys" }
+x509-cert = { git = "https://github.com/RustCrypto/formats.git", rev = "cfacd3efed49b28f38e69612221b8af5f33a5cbf" }
+der_derive = { git = "https://github.com/RustCrypto/formats.git", rev = "cfacd3efed49b28f38e69612221b8af5f33a5cbf" }
 
 [profile.dev]
 opt-level = "z"

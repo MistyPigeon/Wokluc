@@ -366,7 +366,7 @@ void HookContext::post_native_bridge_load(void *handle) {
     auto nb = get_prop(NBPROP);
     auto len = sizeof(ZYGISKLDR) - 1;
     if (nb.size() > len) {
-        arg.load_native_bridge(nb.data() + len, arg.callbacks);
+        arg.load_native_bridge(nb.c_str() + len, arg.callbacks);
     }
     runtime_callbacks = arg.callbacks;
 }
@@ -496,7 +496,7 @@ void HookContext::hook_jni_methods(JNIEnv *env, const char *clz, JNIMethods meth
             auto &new_method = new_methods[i];
             if (new_method.fnPtr == method.fnPtr) {
                 auto &old_method = old_methods[i];
-                ZLOGD("replace %s#%s%s %p -> %p\n", clz, method.name, method.signature, old_method.fnPtr, method.fnPtr);
+                ZLOGV("replace %s#%s%s %p -> %p\n", clz, method.name, method.signature, old_method.fnPtr, method.fnPtr);
                 method.fnPtr = old_method.fnPtr;
                 break;
             }

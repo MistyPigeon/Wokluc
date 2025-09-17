@@ -26,7 +26,7 @@ Actions:
     exit(1);
 }
 
-void denylist_handler(int client, const sock_cred *cred) {
+void denylist_handler(int client) {
     if (client < 0) {
         revert_unmount();
         return;
@@ -90,7 +90,7 @@ int denylist_cli(int argc, char **argv) {
     }
 
     // Send request
-    int fd = connect_daemon(+RequestCode::DENYLIST);
+    int fd = connect_daemon(RequestCode::DENYLIST);
     write_int(fd, req);
     if (req == DenyRequest::ADD || req == DenyRequest::REMOVE) {
         write_string(fd, argv[2]);

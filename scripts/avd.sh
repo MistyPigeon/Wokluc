@@ -1,18 +1,16 @@
 #!/usr/bin/env bash
 
 set -e
+shopt -s extglob
 . scripts/test_common.sh
 
-emu_port=5682
-export ANDROID_SERIAL="emulator-$emu_port"
-
-emu_args_base="-no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -read-only -no-snapshot -port $emu_port -cores $core_count"
+emu_args_base="-no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -read-only -no-snapshot -cores $core_count"
 log_args="-show-kernel -logcat '' -logcat-output logcat.log"
 emu_args=
 emu_pid=
 
 atd_min_api=30
-atd_max_api=35
+atd_max_api=36
 huge_ram_min_api=26
 
 case $(uname -m) in
@@ -88,11 +86,12 @@ resolve_vars() {
   # Determine API level
   local api
   case $ver in
-    [0-9]*) api=$ver ;;
+    +([0-9])) api=$ver ;;
     TiramisuPrivacySandbox) api=33 ;;
     UpsideDownCakePrivacySandbox) api=34 ;;
     VanillaIceCream) api=35 ;;
     Baklava) api=36 ;;
+    36*CANARY) api=10000 ;;
     *)
       print_error "! Unknown system image version '$ver'"
       exit 1
@@ -131,11 +130,15 @@ resolve_vars() {
   dump_vars $arg_list
 }
 
-setup_emu() {
+dl_emu() {
   local avd_pkg=$1
-
   yes | "$sdk" --licenses > /dev/null 2>&1
   "$sdk" --channel=3 platform-tools emulator $avd_pkg
+}
+
+setup_emu() {
+  local avd_pkg=$1
+  dl_emu $avd_pkg
   echo no | "$avd" create avd -f -n test -k $avd_pkg
 }
 
@@ -168,6 +171,11 @@ test_emu() {
 test_main() {
   local avd_pkg ramdisk
   eval $(resolve_vars "emu_args avd_pkg ramdisk" $1 $2)
+
+  # Specify an explicit port so that tests can run with other emulators running at the same time
+  local emu_port=5682
+  emu_args="$emu_args -port $emu_port"
+  export ANDROID_SERIAL="emulator-$emu_port"
 
   setup_emu "$avd_pkg"
 
@@ -211,7 +219,15 @@ run_main() {
   local avd_pkg
   eval $(resolve_vars "emu_args avd_pkg" $1 $2)
   setup_emu "$avd_pkg"
+  print_title "* Launching $avd_pkg"
   "$emu" @test $emu_args 2>/dev/null
+}
+
+dl_main() {
+  local avd_pkg
+  eval $(resolve_vars "avd_pkg" $1 $2)
+  print_title "* Downloading $avd_pkg"
+  dl_emu "$avd_pkg"
 }
 
 case "$1" in
@@ -226,6 +242,10 @@ case "$1" in
     shift
     trap cleanup EXIT
     run_main "$@"
+    ;;
+  dl )
+    shift
+    dl_main "$@"
     ;;
   * )
     print_error "Unknown argument '$1'"

@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 - 2023, John Wu (@topjohnwu)
+ * Copyright 2017 - 2025, John Wu (@topjohnwu)
  * Copyright 2015, Pierre-Hugues Husson <phh@phh.me>
  * Copyright 2010, Adam Shanks (@ChainsDD)
  * Copyright 2008, Zinx Verituse (@zinxv)
@@ -9,6 +9,9 @@
 #include <getopt.h>
 #include <fcntl.h>
 #include <pwd.h>
+#include <linux/securebits.h>
+#include <sys/capability.h>
+#include <sys/prctl.h>
 #include <sched.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -46,6 +49,7 @@ int quit_signals[] = { SIGALRM, SIGABRT, SIGHUP, SIGPIPE, SIGQUIT, SIGTERM, SIGI
     "                                as a primary group if the option -g is not specified\n"
     "  -Z, --context CONTEXT         Change SELinux context\n"
     "  -t, --target PID              PID to take mount namespace from\n"
+    "  -d, --drop-cap                Drop all Linux capabilities\n"
     "  -h, --help                    Display this help message and exit\n"
     "  -, -l, --login                Pretend the shell to be a login shell\n"
     "  -m, -p,\n"
@@ -59,22 +63,14 @@ int quit_signals[] = { SIGALRM, SIGABRT, SIGHUP, SIGPIPE, SIGQUIT, SIGTERM, SIGI
 }
 
 static void sighandler(int sig) {
-    restore_stdin();
-
-    // Assume we'll only be called before death
-    // See note before sigaction() in set_stdin_raw()
-    //
-    // Now, close all standard I/O to cause the pumps
-    // to exit so we can continue and retrieve the exit
-    // code
+    // Close all standard I/O to cause the pumps to exit
+    // so we can continue and retrieve the exit code.
     close(STDIN_FILENO);
     close(STDOUT_FILENO);
     close(STDERR_FILENO);
 
     // Put back all the default handlers
-    struct sigaction act;
-
-    memset(&act, 0, sizeof(act));
+    struct sigaction act{};
     act.sa_handler = SIG_DFL;
     for (int i = 0; quit_signals[i]; ++i) {
         sigaction(quit_signals[i], &act, nullptr);
@@ -82,8 +78,7 @@ static void sighandler(int sig) {
 }
 
 static void setup_sighandlers(void (*handler)(int)) {
-    struct sigaction act;
-    memset(&act, 0, sizeof(act));
+    struct sigaction act{};
     act.sa_handler = handler;
     for (int i = 0; quit_signals[i]; ++i) {
         sigaction(quit_signals[i], &act, nullptr);
@@ -91,8 +86,7 @@ static void setup_sighandlers(void (*handler)(int)) {
 }
 
 int su_client_main(int argc, char *argv[]) {
-    int c;
-    struct option long_opts[] = {
+    option long_opts[] = {
             { "command",                required_argument,  nullptr, 'c' },
             { "help",                   no_argument,        nullptr, 'h' },
             { "login",                  no_argument,        nullptr, 'l' },
@@ -105,6 +99,7 @@ int su_client_main(int argc, char *argv[]) {
             { "group",                  required_argument,  nullptr, 'g' },
             { "supp-group",             required_argument,  nullptr, 'G' },
             { "interactive",            no_argument,        nullptr, 'i' },
+            { "drop-cap",               no_argument,        nullptr, 'd' },
             { nullptr, 0, nullptr, 0 },
     };
 
@@ -121,7 +116,8 @@ int su_client_main(int argc, char *argv[]) {
 
     bool interactive = false;
 
-    while ((c = getopt_long(argc, argv, "c:hlimps:VvuZ:Mt:g:G:", long_opts, nullptr)) != -1) {
+    int c;
+    while ((c = getopt_long(argc, argv, "c:hlimpds:VvuZ:Mt:g:G:", long_opts, nullptr)) != -1) {
         switch (c) {
             case 'c': {
                 string command;
@@ -145,6 +141,9 @@ int su_client_main(int argc, char *argv[]) {
             case 'm':
             case 'p':
                 req.keep_env = true;
+                break;
+            case 'd':
+                req.drop_cap = true;
                 break;
             case 's':
                 req.shell = optarg;
@@ -183,7 +182,7 @@ int su_client_main(int argc, char *argv[]) {
                     fprintf(stderr, "Invalid GID: %s\n", optarg);
                     usage(EXIT_FAILURE);
                 }
-                std::copy(gids.begin(), gids.end(), std::back_inserter(req.gids));
+                ranges::copy(gids, std::back_inserter(req.gids));
                 break;
             }
             default:
@@ -199,19 +198,15 @@ int su_client_main(int argc, char *argv[]) {
     }
     /* username or uid */
     if (optind < argc) {
-        struct passwd *pw;
-        pw = getpwnam(argv[optind]);
-        if (pw)
+        if (const passwd *pw = getpwnam(argv[optind]))
             req.target_uid = pw->pw_uid;
         else
             req.target_uid = parse_int(argv[optind]);
         optind++;
     }
 
-    int ptmx, fd;
-
     // Connect to client
-    fd = connect_daemon(+RequestCode::SUPERUSER);
+    owned_fd fd = connect_daemon(RequestCode::SUPERUSER);
 
     // Send request
     req.write_to_fd(fd);
@@ -240,30 +235,81 @@ int su_client_main(int argc, char *argv[]) {
     if (atty) {
         // We need a PTY. Get one.
         write_int(fd, 1);
-        ptmx = recv_fd(fd);
+        int ptmx = recv_fd(fd);
+        setup_sighandlers(sighandler);
+        // If stdin is not a tty, and if we pump to ptmx, our process may intercept the input to ptmx and
+        // output to stdout, which cause the target process lost input.
+        pump_tty(ptmx, atty & ATTY_IN);
     } else {
         write_int(fd, 0);
     }
 
-    if (atty) {
-        setup_sighandlers(sighandler);
-        // if stdin is not a tty, if we pump to ptmx, our process may intercept the input to ptmx and
-        // output to stdout, which cause the target process lost input.
-        pump_tty(ptmx, (atty & ATTY_IN) ? ptmx : -1);
-    }
-
     // Get the exit code
-    int code = read_int(fd);
-    close(fd);
-
-    return code;
+    return read_int(fd);
 }
 
-// Set effective uid back to root, otherwise setres[ug]id will fail if uid isn't root
-static void set_identity(int uid, const rust::Vec<gid_t> &groups) {
-    if (seteuid(0)) {
-        PLOGE("seteuid (root)");
+static void drop_caps() {
+    static auto last_valid_cap = []() {
+        uint32_t cap = CAP_WAKE_ALARM;
+        while (prctl(PR_CAPBSET_READ, cap) >= 0) {
+            cap++;
+        }
+        return cap - 1;
+    }();
+    // Drop bounding set
+    for (uint32_t cap = 0; cap <= last_valid_cap; cap++) {
+        if (cap != CAP_SETUID) {
+            prctl(PR_CAPBSET_DROP, cap);
+        }
     }
+    // Clean inheritable set
+    __user_cap_header_struct header = {.version = _LINUX_CAPABILITY_VERSION_3};
+    __user_cap_data_struct data[_LINUX_CAPABILITY_U32S_3] = {};
+    if (capget(&header, &data[0]) == 0) {
+        for (size_t i = 0; i < _LINUX_CAPABILITY_U32S_3; i++) {
+            data[i].inheritable = 0;
+        }
+        capset(&header, &data[0]);
+    }
+    // All capabilities will be lost after exec
+    prctl(PR_SET_SECUREBITS, SECBIT_NOROOT);
+    // Except CAP_SETUID in bounding set, it is a marker for restricted process
+}
+
+static bool proc_is_restricted(pid_t pid) {
+    char buf[32] = {};
+    auto bnd = "CapBnd:"sv;
+    uint32_t data[_LINUX_CAPABILITY_U32S_3] = {};
+    ssprintf(buf, sizeof(buf), "/proc/%d/status", pid);
+    owned_fd status_fd = xopen(buf, O_RDONLY | O_CLOEXEC);
+    file_readline(status_fd, [&](Utf8CStr s) -> bool {
+        string_view line = s;
+        if (line.starts_with(bnd)) {
+            auto p = line.begin();
+            advance(p, bnd.size());
+            while (isspace(*p)) advance(p, 1);
+            line.remove_prefix(distance(line.begin(), p));
+            for (int i = 0; i < _LINUX_CAPABILITY_U32S_3; i++) {
+                auto cap = line.substr((_LINUX_CAPABILITY_U32S_3 - 1 - i) * 8, 8);
+                data[i] = parse_uint32_hex(cap);
+            }
+            return false;
+        }
+        return true;
+    });
+
+    bool equal = true;
+    for (int i = 0; i < _LINUX_CAPABILITY_U32S_3; i++) {
+        if (i == CAP_TO_INDEX(CAP_SETUID)) {
+            if (data[i] != CAP_TO_MASK(CAP_SETUID)) equal = false;
+        } else {
+            if (data[i] != 0) equal = false;
+        }
+    }
+    return equal;
+}
+
+static void set_identity(int uid, const rust::Vec<gid_t> &groups) {
     gid_t gid;
     if (!groups.empty()) {
         if (setgroups(groups.size(), groups.data())) {
@@ -382,7 +428,7 @@ void exec_root_shell(int client, int pid, SuRequest &req, MntNsMode mode) {
     char path[32];
     ssprintf(path, sizeof(path), "/proc/%d/cwd", pid);
     char cwd[4096];
-    if (realpath(path, cwd, sizeof(cwd)) > 0)
+    if (canonical_path(path, cwd, sizeof(cwd)) > 0)
         chdir(cwd);
     ssprintf(path, sizeof(path), "/proc/%d/environ", pid);
     auto env = full_read(path);
@@ -404,15 +450,21 @@ void exec_root_shell(int client, int pid, SuRequest &req, MntNsMode mode) {
         }
     }
 
-    // Unblock all signals
-    sigset_t block_set;
-    sigemptyset(&block_set);
-    sigprocmask(SIG_SETMASK, &block_set, nullptr);
+    // Config privileges
     if (!req.context.empty()) {
         auto f = xopen_file("/proc/self/attr/exec", "we");
         if (f) fprintf(f.get(), "%s", req.context.c_str());
     }
-    set_identity(req.target_uid, req.gids);
+    if (req.target_uid != AID_ROOT || req.drop_cap || proc_is_restricted(pid))
+        drop_caps();
+    if (req.target_uid != AID_ROOT || req.gids.size() > 0)
+        set_identity(req.target_uid, req.gids);
+
+    // Unblock all signals
+    sigset_t block_set;
+    sigemptyset(&block_set);
+    sigprocmask(SIG_SETMASK, &block_set, nullptr);
+
     execvp(req.shell.c_str(), (char **) argv);
     fprintf(stderr, "Cannot execute %s: %s\n", req.shell.c_str(), strerror(errno));
     PLOGE("exec");

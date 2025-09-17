@@ -3,6 +3,9 @@
 #include <jni.h>
 #include <core.hpp>
 
+#define ZYGISKLDR       "libzygisk.so"
+#define NBPROP          "ro.dalvik.vm.native.bridge"
+
 #if defined(__LP64__)
 #define ZLOGD(...) LOGD("zygisk64: " __VA_ARGS__)
 #define ZLOGE(...) LOGE("zygisk64: " __VA_ARGS__)
@@ -16,18 +19,11 @@
 #endif
 
 // Extreme verbose logging
-#define ZLOGV(...) ZLOGD(__VA_ARGS__)
-//#define ZLOGV(...) (void*)0
+//#define ZLOGV(...) ZLOGD(__VA_ARGS__)
+#define ZLOGV(...) (void*)0
 
 void hook_entry();
 void hookJniNativeMethods(JNIEnv *env, const char *clz, JNINativeMethod *methods, int numMethods);
-
-inline int zygisk_request(int req) {
-    int fd = connect_daemon(+RequestCode::ZYGISK);
-    if (fd < 0) return fd;
-    write_int(fd, req);
-    return fd;
-}
 
 // The reference of the following structs
 // https://cs.android.com/android/platform/superproject/main/+/main:art/libnativebridge/include/nativebridge/native_bridge.h

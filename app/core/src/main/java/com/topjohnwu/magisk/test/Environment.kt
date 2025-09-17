@@ -58,12 +58,15 @@ class Environment : BaseTest {
             return Build.VERSION.SDK_INT >= 27
         }
 
+        private const val MODULE_UPDATE_PATH  = "/data/adb/modules_update"
         private const val MODULE_ERROR = "Module zip processing incorrect"
         const val MOUNT_TEST = "mount_test"
         const val SEPOLICY_RULE = "sepolicy_rule"
         const val INVALID_ZYGISK = "invalid_zygisk"
         const val REMOVE_TEST = "remove_test"
+        const val REMOVE_TEST_MARKER = "/dev/.remove_test_removed"
         const val EMPTY_ZYGISK = "empty_zygisk"
+        const val UPGRADE_TEST = "upgrade_test"
     }
 
     object TimberLog : CallbackList<String>(Runnable::run) {
@@ -98,8 +101,8 @@ class Environment : BaseTest {
         val error = "$MOUNT_TEST setup failed"
         val path = root.getChildFile(MOUNT_TEST)
 
-        // Create /system/etc/newfile
-        val etc = path.getChildFile("system").getChildFile("etc")
+        // Create /system/fonts/newfile
+        val etc = path.getChildFile("system").getChildFile("fonts")
         assertTrue(error, etc.mkdirs())
         assertTrue(error, etc.getChildFile("newfile").createNewFile())
 
@@ -108,12 +111,21 @@ class Environment : BaseTest {
         assertTrue(error, egg.mkdirs())
         assertTrue(error, egg.getChildFile(".replace").createNewFile())
 
+        // Create /system/app/EasterEgg/newfile
+        assertTrue(error, egg.getChildFile("newfile").createNewFile())
+
         // Delete /system/bin/screenrecord
         val bin = path.getChildFile("system").getChildFile("bin")
         assertTrue(error, bin.mkdirs())
         assertTrue(error, Shell.cmd("mknod $bin/screenrecord c 0 0").exec().isSuccess)
 
         assertTrue(error, Shell.cmd("set_default_perm $path").exec().isSuccess)
+    }
+
+    private fun setupSystemlessHost() {
+        val error = "hosts setup failed"
+        assertTrue(error, runBlocking { RootUtils.addSystemlessHosts() })
+        assertTrue(error, RootUtils.fs.getFile(Const.MODULE_PATH).getChildFile("hosts").exists())
     }
 
     private fun setupSepolicyRuleModule(root: ExtendedFile) {
@@ -163,10 +175,37 @@ class Environment : BaseTest {
         // Create a new module but mark is as "remove"
         val module = LocalModule(path)
         assertTrue(error, path.mkdirs())
+        // Create uninstaller script
+        path.getChildFile("uninstall.sh").newOutputStream().writer().use {
+            it.write("touch $REMOVE_TEST_MARKER")
+        }
         assertTrue(error, path.getChildFile("service.sh").createNewFile())
         module.remove = true
 
         assertTrue(error, Shell.cmd("set_default_perm $path").exec().isSuccess)
+    }
+
+    private fun setupUpgradeModule(root: ExtendedFile, update: ExtendedFile) {
+        val error = "$UPGRADE_TEST setup failed"
+        val oldPath = root.getChildFile(UPGRADE_TEST)
+        val newPath = update.getChildFile(UPGRADE_TEST)
+
+        // Create an existing module but mark as "disable
+        val module = LocalModule(oldPath)
+        assertTrue(error, oldPath.mkdirs())
+        module.enable = false
+        // Install service.sh into the old module
+        assertTrue(error, oldPath.getChildFile("service.sh").createNewFile())
+
+        // Create an upgrade module
+        assertTrue(error, newPath.mkdirs())
+        // Install post-fs-data.sh into the new module
+        assertTrue(error, newPath.getChildFile("post-fs-data.sh").createNewFile())
+
+        assertTrue(error, Shell.cmd(
+            "set_default_perm $oldPath",
+            "set_default_perm $newPath",
+        ).exec().isSuccess)
     }
 
     @Test
@@ -213,11 +252,14 @@ class Environment : BaseTest {
         }
 
         val root = RootUtils.fs.getFile(Const.MODULE_PATH)
-        if (mount()) { setupMountTest(root) }
-        if (preinit()) { setupSepolicyRuleModule(root) }
-        setupEmptyZygiskModule(root)
-        setupInvalidZygiskModule(root)
+        val update = RootUtils.fs.getFile(MODULE_UPDATE_PATH)
+        if (mount()) { setupMountTest(update) }
+        if (preinit()) { setupSepolicyRuleModule(update) }
+        setupSystemlessHost()
+        setupEmptyZygiskModule(update)
+        setupInvalidZygiskModule(update)
         setupRemoveModule(root)
+        setupUpgradeModule(root, update)
     }
 
     @Test

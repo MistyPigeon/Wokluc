@@ -2,7 +2,6 @@
 #include <android/dlext.h>
 #include <dlfcn.h>
 
-#include <consts.hpp>
 #include <base.hpp>
 #include <core.hpp>
 
@@ -10,13 +9,12 @@
 
 using namespace std;
 
-string native_bridge = "0";
+using comp_entry = void(*)(int);
+extern "C" void exec_companion_entry(int, comp_entry);
 
 static void zygiskd(int socket) {
     if (getuid() != 0 || fcntl(socket, F_GETFD) < 0)
         exit(-1);
-
-    init_thread_pool();
 
 #if defined(__LP64__)
     set_nice_name("zygiskd64");
@@ -27,7 +25,6 @@ static void zygiskd(int socket) {
 #endif
 
     // Load modules
-    using comp_entry = void(*)(int);
     vector<comp_entry> modules;
     {
         auto module_fds = recv_fds(socket);
@@ -68,20 +65,7 @@ static void zygiskd(int socket) {
         }
         int module_id = read_int(client);
         if (module_id >= 0 && module_id < modules.size() && modules[module_id]) {
-            exec_task([=, entry = modules[module_id]] {
-                struct stat s1;
-                fstat(client, &s1);
-                entry(client);
-                // Only close client if it is the same file so we don't
-                // accidentally close a re-used file descriptor.
-                // This check is required because the module companion
-                // handler could've closed the file descriptor already.
-                if (struct stat s2; fstat(client, &s2) == 0) {
-                    if (s1.st_dev == s2.st_dev && s1.st_ino == s2.st_ino) {
-                        close(client);
-                    }
-                }
-            });
+            exec_companion_entry(client, modules[module_id]);
         } else {
             close(client);
         }
@@ -109,11 +93,3 @@ extern "C" [[maybe_unused]] NativeBridgeCallbacks NativeBridgeItf {
         return false;
     },
 };
-
-void restore_zygisk_prop() {
-    string native_bridge_orig = "0";
-    if (native_bridge.length() > strlen(ZYGISKLDR)) {
-        native_bridge_orig = native_bridge.substr(strlen(ZYGISKLDR));
-    }
-    set_prop(NBPROP, native_bridge_orig.data());
-}

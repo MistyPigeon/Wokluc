@@ -1,6 +1,6 @@
 use crate::consts::{ROOTMNT, ROOTOVL};
 use crate::ffi::MagiskInit;
-use base::libc::{O_CREAT, O_RDONLY, O_WRONLY};
+use base::nix::fcntl::OFlag;
 use base::{
     BufReadExt, Directory, FsPathBuilder, LoggedResult, ResultExt, Utf8CStr, Utf8CString,
     clone_attr, cstr, debug,
@@ -32,9 +32,6 @@ on nonencrypted
 
 on property:sys.boot_completed=1
     exec {0} 0 0 -- {1}/magisk --boot-complete
-
-on property:init.svc.zygote=stopped
-    exec {0} 0 0 -- {1}/magisk --zygote-restart
 "#,
         "u:r:magisk:s0", tmp_dir
     )
@@ -47,9 +44,9 @@ pub struct OverlayAttr(Utf8CString, Utf8CString);
 
 impl MagiskInit {
     pub(crate) fn parse_config_file(&mut self) {
-        if let Ok(fd) = cstr!("/data/.backup/.magisk").open(O_RDONLY) {
+        if let Ok(fd) = cstr!("/data/.backup/.magisk").open(OFlag::O_RDONLY) {
             let mut reader = BufReader::new(fd);
-            reader.foreach_props(|key, val| {
+            reader.for_each_prop(|key, val| {
                 if key == "PREINITDEVICE" {
                     self.preinit_dev = val.to_string();
                     return false;
@@ -98,7 +95,7 @@ impl MagiskInit {
         let mut mount_list = String::new();
         self.mount_impl(cstr!(ROOTOVL), dest, &mut mount_list)
             .log_ok();
-        if let Ok(mut fd) = cstr!(ROOTMNT).create(O_CREAT | O_WRONLY, 0) {
+        if let Ok(mut fd) = cstr!(ROOTMNT).create(OFlag::O_CREAT | OFlag::O_WRONLY, 0) {
             fd.write(mount_list.as_bytes()).log_ok();
         }
     }

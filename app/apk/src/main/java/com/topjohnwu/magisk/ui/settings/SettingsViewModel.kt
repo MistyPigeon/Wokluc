@@ -22,11 +22,11 @@ import com.topjohnwu.magisk.core.ktx.activity
 import com.topjohnwu.magisk.core.ktx.toast
 import com.topjohnwu.magisk.core.tasks.AppMigration
 import com.topjohnwu.magisk.core.utils.LocaleSetting
+import com.topjohnwu.magisk.core.utils.RootUtils
 import com.topjohnwu.magisk.databinding.bindExtra
 import com.topjohnwu.magisk.events.AddHomeIconEvent
 import com.topjohnwu.magisk.events.AuthEvent
 import com.topjohnwu.magisk.events.SnackbarEvent
-import com.topjohnwu.superuser.Shell
 import kotlinx.coroutines.launch
 
 class SettingsViewModel : BaseViewModel(), BaseSettingsItem.Handler {
@@ -83,6 +83,9 @@ class SettingsViewModel : BaseViewModel(), BaseSettingsItem.Handler {
                 // Can hide overlay windows on 12.0+
                 list.remove(Tapjack)
             }
+            if (Const.Version.atLeast_30_1()) {
+                list.add(Restrict)
+            }
         }
 
         return list
@@ -127,7 +130,8 @@ class SettingsViewModel : BaseViewModel(), BaseSettingsItem.Handler {
     }
 
     private fun createHosts() {
-        Shell.cmd("add_hosts_module").submit {
+        viewModelScope.launch {
+            RootUtils.addSystemlessHosts()
             AppContext.toast(R.string.settings_hosts_toast, Toast.LENGTH_SHORT)
         }
     }

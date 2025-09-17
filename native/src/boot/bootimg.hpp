@@ -3,9 +3,7 @@
 #include <cstdint>
 #include <utility>
 #include <bitset>
-#include <cxx.h>
-
-#include "format.hpp"
+#include <rust/cxx.h>
 
 /******************
  * Special Headers
@@ -347,6 +345,17 @@ struct vendor_ramdisk_table_entry_v4 {
  * Polymorphic Universal Header
  *******************************/
 
+template <typename T>
+static T align_to(T v, int a) {
+    static_assert(std::is_integral_v<T>);
+    return (v + a - 1) / a * a;
+}
+
+template <typename T>
+static T align_padding(T v, int a) {
+    return align_to(v, a) - v;
+}
+
 #define decl_val(name, len) \
 virtual uint##len##_t name() const { return 0; }
 
@@ -676,7 +685,12 @@ struct boot_img {
     std::pair<const uint8_t *, dyn_img_hdr *> create_hdr(const uint8_t *addr, FileFormat type);
 
     // Rust FFI
+    static std::unique_ptr<boot_img> create(Utf8CStr name) { return std::make_unique<boot_img>(name.c_str()); }
     rust::Slice<const uint8_t> get_payload() const { return payload; }
     rust::Slice<const uint8_t> get_tail() const { return tail; }
-    bool verify(const char *cert = nullptr) const;
+    bool is_signed() const { return flags[AVB1_SIGNED_FLAG]; }
+    uint64_t tail_off() const { return tail.data() - map.data(); }
+
+    // Implemented in Rust
+    bool verify() const noexcept;
 };

@@ -17,15 +17,12 @@ LOCAL_STATIC_LIBRARIES := \
 LOCAL_SRC_FILES := \
     core/applets.cpp \
     core/magisk.cpp \
-    core/daemon.cpp \
     core/scripting.cpp \
     core/sqlite.cpp \
-    core/module.cpp \
-    core/thread.cpp \
+    core/utils.cpp \
     core/core-rs.cpp \
-    core/resetprop/resetprop.cpp \
+    core/resetprop/sys.cpp \
     core/su/su.cpp \
-    core/su/connect.cpp \
     core/zygisk/entry.cpp \
     core/zygisk/module.cpp \
     core/zygisk/hook.cpp \
@@ -83,14 +80,11 @@ include $(CLEAR_VARS)
 LOCAL_MODULE := magiskboot
 LOCAL_STATIC_LIBRARIES := \
     libbase \
-    liblzma \
     liblz4 \
     libboot-rs
 
 LOCAL_SRC_FILES := \
-    boot/main.cpp \
     boot/bootimg.cpp \
-    boot/format.cpp \
     boot/boot-rs.cpp
 
 LOCAL_LDFLAGS := -static
@@ -128,7 +122,7 @@ LOCAL_STATIC_LIBRARIES := \
 
 LOCAL_SRC_FILES := \
     core/applet_stub.cpp \
-    core/resetprop/resetprop.cpp \
+    core/resetprop/sys.cpp \
     core/core-rs.cpp
 
 LOCAL_CFLAGS := -DAPPLET_STUB_MAIN=resetprop_main

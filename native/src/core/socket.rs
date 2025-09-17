@@ -7,6 +7,7 @@ use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{AncillaryData, SocketAncillary, UnixStream};
 
 pub trait Encodable {
+    #[allow(dead_code)]
     fn encoded_len(&self) -> usize;
     fn encode(&self, w: &mut impl Write) -> io::Result<()>;
 }
@@ -233,11 +234,6 @@ pub fn send_fd(socket: RawFd, fd: RawFd) -> bool {
     } else {
         socket.send_fds(&[fd]).log().is_ok()
     }
-}
-
-pub fn send_fds(socket: RawFd, fds: &[RawFd]) -> bool {
-    let mut socket = ManuallyDrop::new(unsafe { UnixStream::from_raw_fd(socket) });
-    socket.send_fds(fds).log().is_ok()
 }
 
 pub fn recv_fd(socket: RawFd) -> RawFd {

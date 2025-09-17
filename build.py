@@ -11,7 +11,6 @@ import stat
 import subprocess
 import sys
 import tarfile
-import textwrap
 import urllib.request
 from pathlib import Path
 from zipfile import ZipFile
@@ -71,7 +70,7 @@ default_archs = {"armeabi-v7a", "x86", "arm64-v8a", "x86_64"}
 default_targets = {"magisk", "magiskinit", "magiskboot", "magiskpolicy"}
 support_targets = default_targets | {"resetprop"}
 rust_targets = {"magisk", "magiskinit", "magiskboot", "magiskpolicy"}
-ondk_version = "r28.4"
+ondk_version = "r29.2"
 
 # Global vars
 config = {}
@@ -530,7 +529,10 @@ def gen_ide():
 def clippy_cli():
     ensure_toolchain()
     args.force_out = True
-    set_archs(default_archs)
+    if args.abi:
+        set_archs({args.abi})
+    else:
+        set_archs(default_archs)
 
     os.chdir(Path("native", "src"))
     cmds = ["clippy", "--no-deps", "--target"]
@@ -837,6 +839,7 @@ def parse_args():
     cargo_parser.add_argument("commands", nargs=argparse.REMAINDER)
 
     clippy_parser = subparsers.add_parser("clippy", help="run clippy on Rust sources")
+    clippy_parser.add_argument("--abi", help="target ABI to generate")
 
     rustup_parser = subparsers.add_parser("rustup", help="setup rustup wrapper")
     rustup_parser.add_argument(

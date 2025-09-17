@@ -4,8 +4,7 @@ use std::{iter::Peekable, vec::IntoIter};
 
 use crate::SePolicy;
 use crate::ffi::Xperm;
-use base::libc::{O_CLOEXEC, O_RDONLY};
-use base::{BufReadExt, LoggedResult, Utf8CStr, error, warn};
+use base::{BufReadExt, LoggedResult, Utf8CStr, error, nix::fcntl::OFlag, warn};
 
 pub enum Token<'a> {
     AL,
@@ -202,10 +201,10 @@ fn parse_xperms<'a>(tokens: &mut Tokens<'a>) -> ParseResult<'a, Vec<Xperm>> {
 }
 
 fn match_string<'a>(tokens: &mut Tokens<'a>, pattern: &str) -> ParseResult<'a, ()> {
-    if let Some(Token::ID(s)) = tokens.next() {
-        if s == pattern {
-            return Ok(());
-        }
+    if let Some(Token::ID(s)) = tokens.next()
+        && s == pattern
+    {
+        return Ok(());
     }
     Err(ParseError::General)
 }
@@ -263,7 +262,7 @@ fn extract_token<'a>(s: &'a str, tokens: &mut Vec<Token<'a>>) {
     }
 }
 
-fn tokenize_statement(statement: &str) -> Vec<Token> {
+fn tokenize_statement(statement: &str) -> Vec<Token<'_>> {
     let mut tokens = Vec::new();
     for s in statement.split_whitespace() {
         extract_token(s, &mut tokens);
@@ -279,7 +278,7 @@ impl SePolicy {
 
     pub fn load_rule_file(&mut self, filename: &Utf8CStr) {
         let result: LoggedResult<()> = try {
-            let file = filename.open(O_RDONLY | O_CLOEXEC)?;
+            let file = filename.open(OFlag::O_RDONLY | OFlag::O_CLOEXEC)?;
             let mut reader = BufReader::new(file);
             self.load_rules_from_reader(&mut reader);
         };
@@ -287,7 +286,7 @@ impl SePolicy {
     }
 
     fn load_rules_from_reader<T: BufRead>(&mut self, reader: &mut T) {
-        reader.foreach_lines(|line| {
+        reader.for_each_line(|line| {
             self.parse_statement(line);
             true
         });
@@ -504,7 +503,7 @@ impl Display for Token<'_> {
             Token::ST => f.write_char('*'),
             Token::TL => f.write_char('~'),
             Token::HP => f.write_char('-'),
-            Token::HX(n) => f.write_fmt(format_args!("{:06X}", n)),
+            Token::HX(n) => f.write_fmt(format_args!("{n:06X}")),
             Token::ID(s) => f.write_str(s),
         }
     }
